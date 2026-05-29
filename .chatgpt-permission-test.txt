@@ -1,4 +1,0 @@
-ChatGPT GitHub permission test
-Repository: llq1913245916/chat-gpt5.5
-Created for read/write permission verification on 2026-05-29.
-This file is temporary and should be deleted immediately after verification.
