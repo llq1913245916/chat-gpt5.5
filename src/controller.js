@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import {
-  issueKey,
   REVIEW_STATUS,
   validateControllerLimits,
   validateReview,
@@ -18,6 +17,20 @@ function normalizeDraft(value) {
 function isUnresolvedDecision(decision) {
   return decision.verdict === 'REJECT'
     || (decision.verdict === 'PARTIAL' && decision.residualDispute === true);
+}
+
+function publicDisputeRegistry(registry) {
+  return [...registry.values()]
+    .filter((state) => state.lastUnresolved === true)
+    .map((state) => ({
+      disputeId: state.disputeId,
+      target: state.issue.target,
+      claim: state.issue.claim,
+      basis: {
+        type: state.issue.basis.type,
+        locator: state.issue.basis.locator,
+      },
+    }));
 }
 
 export class DualAIReviewController {
@@ -38,7 +51,8 @@ export class DualAIReviewController {
 
     const truth = Object.freeze({ task: task.trim(), source });
     const sessionId = this.store ? await this.store.createSession(truth) : randomUUID();
-    const disputeStates = new Map();
+    const disputeRegistry = new Map();
+    let nextDisputeNumber = 1;
 
     let version = 0;
     let current = normalizeDraft(await this.author.draft({ truth, round: 0, sessionId }));
@@ -47,6 +61,7 @@ export class DualAIReviewController {
       answer: current.answer,
       reason: 'initial-author-draft',
     };
+    let latestDisputed = null;
 
     await this.store?.recordVersion(sessionId, version, {
       version,
@@ -57,52 +72,81 @@ export class DualAIReviewController {
     });
 
     for (let round = 1; round <= this.maxRounds; round += 1) {
-      const review = validateReview(await this.reviewer.review({
+      const priorDisputes = publicDisputeRegistry(disputeRegistry);
+      const rawReview = await this.reviewer.review({
         truth,
         candidate: current.answer,
         round,
         sessionId,
-      }), { hasSource: Boolean(truth.source?.trim()) });
+        priorDisputes,
+      });
 
-      await this.store?.recordReview(sessionId, round, review);
+      const review = validateReview(rawReview, {
+        sourceText: truth.source,
+        candidateText: current.answer,
+      });
 
-      if (review.status === REVIEW_STATUS.PASS) {
-        trusted = {
-          version,
-          answer: current.answer,
-          reason: 'reviewer-pass',
-        };
+      const boundReview = {
+        ...review,
+        issues: review.issues.map((issue) => {
+          let disputeId = issue.relatedDisputeId ?? null;
+
+          if (disputeId) {
+            if (!disputeRegistry.has(disputeId)) {
+              throw new Error(`Protocol error: unknown relatedDisputeId: ${disputeId}`);
+            }
+          } else {
+            disputeId = `D-${String(nextDisputeNumber).padStart(4, '0')}`;
+            nextDisputeNumber += 1;
+          }
+
+          return { ...issue, disputeId };
+        }),
+      };
+
+      const boundIds = new Set(boundReview.issues.map((issue) => issue.disputeId));
+      if (boundIds.size !== boundReview.issues.length) {
+        throw new Error('Protocol error: multiple review issues cannot bind to the same disputeId');
+      }
+
+      await this.store?.recordReview(sessionId, round, boundReview);
+
+      // Invariant: current is always a trusted checkpoint.
+      // Therefore a PASS can never launder a disputed descendant.
+      if (boundReview.status === REVIEW_STATUS.PASS) {
         return this.#finish(sessionId, {
           status: 'PASS',
           rounds: round,
           answer: current.answer,
-          answerTrust: 'reviewer-pass',
-          review,
+          answerTrust: 'reviewer-pass-on-trusted-checkpoint',
+          review: boundReview,
         });
       }
 
-      const preRevision = {
-        version,
-        answer: current.answer,
-      };
+      const revision = validateRevision(
+        await this.author.revise({
+          truth,
+          candidate: current.answer,
+          review: boundReview,
+          round,
+          sessionId,
+        }),
+        boundReview,
+        {
+          sourceText: truth.source,
+          candidateText: current.answer,
+        },
+      );
 
-      const revision = validateRevision(await this.author.revise({
-        truth,
-        candidate: current.answer,
-        review,
-        round,
-        sessionId,
-      }), review, { hasSource: Boolean(truth.source?.trim()) });
-
-      const seenKeys = new Set();
+      const seenDisputeIds = new Set();
       let hasUnresolvedDispute = false;
 
-      for (const issue of review.issues) {
+      for (const issue of boundReview.issues) {
         const decision = revision.decisions.find((item) => item.issueId === issue.id);
-        const key = issueKey(issue);
-        seenKeys.add(key);
+        const disputeId = issue.disputeId;
+        seenDisputeIds.add(disputeId);
 
-        const previous = disputeStates.get(key);
+        const previous = disputeRegistry.get(disputeId);
         const unresolved = isUnresolvedDecision(decision);
         hasUnresolvedDispute ||= unresolved;
 
@@ -115,7 +159,8 @@ export class DualAIReviewController {
             )
           : 0;
 
-        disputeStates.set(key, {
+        disputeRegistry.set(disputeId, {
+          disputeId,
           lastSeenRound: round,
           lastVerdict: decision.verdict,
           lastUnresolved: unresolved,
@@ -124,9 +169,9 @@ export class DualAIReviewController {
         });
       }
 
-      for (const [key, state] of disputeStates.entries()) {
-        if (!seenKeys.has(key) && state.lastSeenRound < round) {
-          disputeStates.set(key, {
+      for (const [disputeId, state] of disputeRegistry.entries()) {
+        if (!seenDisputeIds.has(disputeId) && state.lastSeenRound < round) {
+          disputeRegistry.set(disputeId, {
             ...state,
             lastUnresolved: false,
             consecutiveUnresolved: 0,
@@ -135,19 +180,19 @@ export class DualAIReviewController {
       }
 
       version += 1;
-      const next = { answer: revision.answer };
+      const proposed = { answer: revision.answer };
 
       await this.store?.recordVersion(sessionId, version, {
         version,
         round,
         kind: hasUnresolvedDispute ? 'disputed-revision' : 'revision',
-        trust: hasUnresolvedDispute ? 'untrusted-pending-dispute' : 'trusted-checkpoint',
-        answer: next.answer,
-        previousVersion: preRevision.version,
+        trust: hasUnresolvedDispute ? 'untrusted-discarded-branch' : 'trusted-checkpoint',
+        answer: proposed.answer,
+        baseTrustedVersion: trusted.version,
         decisions: revision.decisions,
       });
 
-      const repeatedDispute = [...disputeStates.values()].find(
+      const repeatedDispute = [...disputeRegistry.values()].find(
         (state) => state.consecutiveUnresolved >= this.disagreementLimit,
       );
 
@@ -158,34 +203,42 @@ export class DualAIReviewController {
           answer: trusted.answer,
           answerTrust: 'last-trusted-checkpoint',
           trustedVersion: trusted.version,
-          disputedRevision: next.answer,
+          disputedRevision: proposed.answer,
           disputedVersion: version,
           disputedIssue: repeatedDispute.issue,
-          message: 'The same grounded issue remains unresolved across consecutive rounds. Returning the last trusted checkpoint and surfacing the disputed revision separately.',
+          message: 'The same controller-managed dispute remains unresolved across consecutive rounds. Returning the last trusted checkpoint; the disputed branch is never promoted automatically.',
         });
       }
 
-      current = next;
-
-      if (!hasUnresolvedDispute) {
-        trusted = {
+      if (hasUnresolvedDispute) {
+        // Fail-safe: do not continue from a descendant of a rejected/partial critique.
+        // The next reviewer round receives the unchanged trusted checkpoint plus the
+        // controller-managed prior dispute registry.
+        latestDisputed = {
           version,
-          answer: current.answer,
-          reason: 'all-review-issues-resolved',
+          answer: proposed.answer,
         };
+        continue;
       }
+
+      current = proposed;
+      trusted = {
+        version,
+        answer: current.answer,
+        reason: 'all-review-issues-resolved',
+      };
+      latestDisputed = null;
     }
 
-    const latestIsTrusted = current.answer === trusted.answer;
     return this.#finish(sessionId, {
       status: 'MAX_ROUNDS',
       rounds: this.maxRounds,
       answer: trusted.answer,
       answerTrust: 'last-trusted-checkpoint',
       trustedVersion: trusted.version,
-      candidate: latestIsTrusted ? undefined : current.answer,
-      candidateTrust: latestIsTrusted ? undefined : 'untrusted-pending-dispute',
-      message: 'Maximum review rounds reached. Returning the last trusted checkpoint; inspect the recorded candidate/history before continuing.',
+      disputedRevision: latestDisputed?.answer,
+      disputedVersion: latestDisputed?.version,
+      message: 'Maximum review rounds reached. Returning the last trusted checkpoint; unresolved branches remain separate.',
     });
   }
 
