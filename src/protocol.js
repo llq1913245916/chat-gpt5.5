@@ -16,34 +16,61 @@ function nonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function normalizeIdentity(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-    .replace(/[^\p{L}\p{N}:._/ -]/gu, '')
-    .trim();
+function normalizeText(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
-export function issueKey(issue) {
-  return [
-    normalizeIdentity(issue.target),
-    normalizeIdentity(issue.basis?.type),
-    normalizeIdentity(issue.basis?.locator),
-  ].join('|');
+function quoteExists(haystack, quote) {
+  const normalizedHaystack = normalizeText(haystack);
+  const normalizedQuote = normalizeText(quote);
+  return normalizedQuote.length > 0 && normalizedHaystack.includes(normalizedQuote);
 }
 
-export function validateBasis(basis, label, { hasSource = true } = {}) {
-  assert(basis && typeof basis === 'object' && !Array.isArray(basis), `${label}.basis must be an object`);
-  assert(BASIS_TYPES.has(basis.type), `${label}.basis.type must be source, candidate, or logic`);
+export function validateBasis(
+  basis,
+  label,
+  { sourceText = '', candidateText = '' } = {},
+) {
+  assert(
+    basis && typeof basis === 'object' && !Array.isArray(basis),
+    `${label}.basis must be an object`,
+  );
+  assert(
+    BASIS_TYPES.has(basis.type),
+    `${label}.basis.type must be source, candidate, or logic`,
+  );
   assert(nonEmptyString(basis.locator), `${label}.basis.locator is required`);
   assert(nonEmptyString(basis.evidence), `${label}.basis.evidence is required`);
+
   if (basis.type === 'source') {
-    assert(hasSource, `${label}.basis.type=source requires a Source of Truth`);
+    assert(nonEmptyString(sourceText), `${label}.basis.type=source requires a Source of Truth`);
+    assert(nonEmptyString(basis.quote), `${label}.basis.quote is required for source grounding`);
+    assert(
+      quoteExists(sourceText, basis.quote),
+      `${label}.basis.quote does not resolve in Source of Truth`,
+    );
   }
+
+  if (basis.type === 'candidate') {
+    assert(nonEmptyString(candidateText), `${label}.basis.type=candidate requires a candidate answer`);
+    assert(nonEmptyString(basis.quote), `${label}.basis.quote is required for candidate grounding`);
+    assert(
+      quoteExists(candidateText, basis.quote),
+      `${label}.basis.quote does not resolve in candidate answer`,
+    );
+  }
+
+  if (basis.type === 'logic' && basis.quote !== undefined) {
+    assert(typeof basis.quote === 'string', `${label}.basis.quote must be a string when present`);
+  }
+
   return basis;
 }
 
-export function validateReview(input, { hasSource = true } = {}) {
+export function validateReview(
+  input,
+  { sourceText = '', candidateText = '' } = {},
+) {
   assert(input && typeof input === 'object' && !Array.isArray(input), 'review must be an object');
   assert(Object.values(REVIEW_STATUS).includes(input.status), 'status must be PASS or REVISE');
   assert(Number.isFinite(input.score) && input.score >= 0 && input.score <= 100, 'score must be 0..100');
@@ -57,24 +84,36 @@ export function validateReview(input, { hasSource = true } = {}) {
   }
 
   const seenIds = new Set();
-  const seenKeys = new Set();
+  const relatedIds = new Set();
 
   for (const issue of input.issues) {
     assert(issue && typeof issue === 'object', 'each issue must be an object');
     assert(nonEmptyString(issue.id), 'issue.id is required');
     assert(!seenIds.has(issue.id), `duplicate issue id: ${issue.id}`);
     seenIds.add(issue.id);
+
     assert(SEVERITIES.has(issue.severity), `invalid severity for ${issue.id}`);
-    assert(Number.isFinite(issue.confidence) && issue.confidence >= 0 && issue.confidence <= 1, `confidence must be 0..1 for ${issue.id}`);
+    assert(
+      Number.isFinite(issue.confidence) && issue.confidence >= 0 && issue.confidence <= 1,
+      `confidence must be 0..1 for ${issue.id}`,
+    );
     assert(nonEmptyString(issue.target), `target is required for ${issue.id}`);
     assert(nonEmptyString(issue.claim), `claim is required for ${issue.id}`);
     assert(nonEmptyString(issue.suggestion), `suggestion is required for ${issue.id}`);
-    validateBasis(issue.basis, `issue ${issue.id}`, { hasSource });
 
-    const key = issueKey(issue);
-    assert(key && !key.startsWith('||'), `stable issue identity is required for ${issue.id}`);
-    assert(!seenKeys.has(key), `duplicate semantic issue target/basis in one review: ${issue.id}`);
-    seenKeys.add(key);
+    if (issue.relatedDisputeId !== null && issue.relatedDisputeId !== undefined) {
+      assert(
+        nonEmptyString(issue.relatedDisputeId),
+        `relatedDisputeId must be null or non-empty for ${issue.id}`,
+      );
+      assert(
+        !relatedIds.has(issue.relatedDisputeId),
+        `duplicate relatedDisputeId in one review: ${issue.relatedDisputeId}`,
+      );
+      relatedIds.add(issue.relatedDisputeId);
+    }
+
+    validateBasis(issue.basis, `issue ${issue.id}`, { sourceText, candidateText });
   }
 
   if (input.uncertainties !== undefined) {
@@ -87,7 +126,11 @@ export function validateReview(input, { hasSource = true } = {}) {
   };
 }
 
-export function validateRevision(input, review, { hasSource = true } = {}) {
+export function validateRevision(
+  input,
+  review,
+  { sourceText = '', candidateText = '' } = {},
+) {
   assert(input && typeof input === 'object' && !Array.isArray(input), 'revision must be an object');
   assert(nonEmptyString(input.answer), 'revision.answer is required');
   assert(Array.isArray(input.decisions), 'revision.decisions must be an array');
@@ -100,21 +143,34 @@ export function validateRevision(input, review, { hasSource = true } = {}) {
     assert(requiredIds.has(decision.issueId), `unknown issueId: ${decision.issueId}`);
     assert(!decidedIds.has(decision.issueId), `duplicate decision for: ${decision.issueId}`);
     decidedIds.add(decision.issueId);
+
     assert(VERDICTS.has(decision.verdict), `invalid verdict for ${decision.issueId}`);
     assert(nonEmptyString(decision.reason), `reason is required for ${decision.issueId}`);
-    validateBasis(decision.basis, `decision ${decision.issueId}`, { hasSource });
-    assert(typeof decision.residualDispute === 'boolean', `residualDispute is required for ${decision.issueId}`);
+    validateBasis(decision.basis, `decision ${decision.issueId}`, { sourceText, candidateText });
+    assert(
+      typeof decision.residualDispute === 'boolean',
+      `residualDispute is required for ${decision.issueId}`,
+    );
 
     if (decision.verdict === 'ACCEPT') {
-      assert(decision.residualDispute === false, `ACCEPT cannot retain residualDispute for ${decision.issueId}`);
+      assert(
+        decision.residualDispute === false,
+        `ACCEPT cannot retain residualDispute for ${decision.issueId}`,
+      );
     }
     if (decision.verdict === 'REJECT') {
-      assert(decision.residualDispute === true, `REJECT must retain residualDispute for ${decision.issueId}`);
+      assert(
+        decision.residualDispute === true,
+        `REJECT must retain residualDispute for ${decision.issueId}`,
+      );
     }
     if (decision.verdict === 'PARTIAL') {
       assert(nonEmptyString(decision.acceptedPart), `PARTIAL requires acceptedPart for ${decision.issueId}`);
       assert(nonEmptyString(decision.rejectedPart), `PARTIAL requires rejectedPart for ${decision.issueId}`);
-      assert(decision.residualDispute === true, `PARTIAL must retain residualDispute for ${decision.issueId}`);
+      assert(
+        decision.residualDispute === true,
+        `PARTIAL must retain residualDispute for ${decision.issueId}`,
+      );
     }
   }
 
@@ -130,8 +186,7 @@ export function projectReviewForAuthor(review) {
     status: review.status,
     issues: review.issues.map((issue) => ({
       id: issue.id,
-      severity: issue.severity,
-      confidence: issue.confidence,
+      disputeId: issue.disputeId,
       target: issue.target,
       claim: issue.claim,
       basis: issue.basis,
@@ -141,8 +196,14 @@ export function projectReviewForAuthor(review) {
 
 export function validateControllerLimits({ maxRounds, disagreementLimit }) {
   assert(Number.isInteger(maxRounds) && Number.isFinite(maxRounds), 'maxRounds must be a finite integer');
-  assert(maxRounds >= 1 && maxRounds <= MAX_ROUNDS_HARD_LIMIT, `maxRounds must be 1..${MAX_ROUNDS_HARD_LIMIT}`);
-  assert(Number.isInteger(disagreementLimit) && Number.isFinite(disagreementLimit), 'disagreementLimit must be a finite integer');
+  assert(
+    maxRounds >= 1 && maxRounds <= MAX_ROUNDS_HARD_LIMIT,
+    `maxRounds must be 1..${MAX_ROUNDS_HARD_LIMIT}`,
+  );
+  assert(
+    Number.isInteger(disagreementLimit) && Number.isFinite(disagreementLimit),
+    'disagreementLimit must be a finite integer',
+  );
   assert(disagreementLimit >= 1, 'disagreementLimit must be >= 1');
   assert(disagreementLimit <= maxRounds, 'disagreementLimit cannot exceed maxRounds');
 }
