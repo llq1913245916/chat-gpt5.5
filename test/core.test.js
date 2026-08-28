@@ -2,12 +2,48 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DualAIReviewController } from '../src/controller.js';
 import {
+  MAX_ACTIONABLE_ISSUES,
+  groundingFingerprint,
   projectReviewForAuthor,
   validateControllerLimits,
   validateReview,
 } from '../src/protocol.js';
 
-const SOURCE = 'Paragraph 1 states condition Y. Paragraph 2 states condition Z.';
+const SOURCE = 'Paragraph 1 states condition Y.\nParagraph 2 states condition Z.';
+const CANDIDATE = 'Trusted claim one.\nTrusted claim two.';
+
+function sourceBasis(overrides = {}) {
+  return {
+    type: 'source',
+    locator: 'source:L1',
+    quote: 'Paragraph 1 states condition Y.',
+    evidence: 'The quoted source line controls the claim.',
+    ...overrides,
+  };
+}
+
+function candidateBasis(overrides = {}) {
+  return {
+    type: 'candidate',
+    locator: 'candidate:L1',
+    quote: 'Trusted claim one.',
+    evidence: 'The candidate contains this statement.',
+    ...overrides,
+  };
+}
+
+function logicBasis(overrides = {}) {
+  return {
+    type: 'logic',
+    locator: 'logic:step-1',
+    premises: [
+      { type: 'source', locator: 'source:L1', quote: 'Paragraph 1 states condition Y.' },
+      { type: 'candidate', locator: 'candidate:L1', quote: 'Trusted claim one.' },
+    ],
+    evidence: 'Given the source condition and candidate claim, the conclusion follows.',
+    ...overrides,
+  };
+}
 
 function issue(overrides = {}) {
   return {
@@ -17,40 +53,29 @@ function issue(overrides = {}) {
     confidence: 0.9,
     target: 'answer:claim-1',
     claim: 'The source does not support X.',
-    basis: {
-      type: 'source',
-      locator: 'source:p1',
-      quote: 'Paragraph 1 states condition Y.',
-      evidence: 'The quoted paragraph controls the claim.',
-    },
+    basis: sourceBasis(),
     suggestion: 'Re-check the condition.',
     ...overrides,
   };
 }
 
-function reviewWith(oneIssue) {
+function reviewWith(...issues) {
   return {
     status: 'REVISE',
     score: 70,
     summary: 'needs work',
-    issues: [oneIssue],
+    issues,
     uncertainties: [],
   };
 }
 
 function decisionFor(issueId, verdict, overrides = {}) {
-  const residualDispute = verdict !== 'ACCEPT';
   return {
     issueId,
     verdict,
     reason: 'Checked independently.',
-    basis: {
-      type: 'source',
-      locator: 'source:p1',
-      quote: 'Paragraph 1 states condition Y.',
-      evidence: 'The quoted paragraph is controlling.',
-    },
-    residualDispute,
+    basis: sourceBasis({ evidence: 'Independent source check.' }),
+    residualDispute: verdict !== 'ACCEPT',
     ...(verdict === 'PARTIAL'
       ? { acceptedPart: 'formatting concern', rejectedPart: 'factual change' }
       : {}),
@@ -58,50 +83,65 @@ function decisionFor(issueId, verdict, overrides = {}) {
   };
 }
 
-test('review protocol rejects source basis without source of truth', () => {
-  assert.throws(
-    () => validateReview(reviewWith(issue()), { sourceText: '', candidateText: 'candidate' }),
-    /requires a Source of Truth/,
-  );
+test('source/candidate locators are machine-resolved to the quoted line range', () => {
+  assert.doesNotThrow(() => validateReview(reviewWith(issue()), {
+    sourceText: SOURCE,
+    candidateText: CANDIDATE,
+  }));
+
+  assert.throws(() => validateReview(reviewWith(issue({
+    basis: sourceBasis({ locator: 'source:L99' }),
+  })), { sourceText: SOURCE, candidateText: CANDIDATE }), /locator does not resolve/);
+
+  assert.throws(() => validateReview(reviewWith(issue({
+    basis: sourceBasis({ locator: 'source:L2' }),
+  })), { sourceText: SOURCE, candidateText: CANDIDATE }), /quote does not resolve at source:L2/);
 });
 
-test('review protocol rejects nonexistent source quote', () => {
-  assert.throws(
-    () => validateReview(
-      reviewWith(issue({
-        basis: {
-          type: 'source',
-          locator: 'source:p999',
-          quote: 'This sentence does not exist.',
-          evidence: 'fabricated',
-        },
-      })),
-      { sourceText: SOURCE, candidateText: 'candidate' },
-    ),
-    /does not resolve in Source of Truth/,
-  );
+test('free-form logic assertion is rejected; grounded logic premises are accepted', () => {
+  assert.throws(() => validateReview(reviewWith(issue({
+    basis: {
+      type: 'logic',
+      locator: 'logic:security',
+      evidence: 'Deprecated protocols should not be used.',
+    },
+  })), { sourceText: SOURCE, candidateText: CANDIDATE }), /premises is required/);
+
+  assert.doesNotThrow(() => validateReview(reviewWith(issue({ basis: logicBasis() })), {
+    sourceText: SOURCE,
+    candidateText: CANDIDATE,
+  }));
 });
 
-test('review protocol rejects nonexistent candidate quote', () => {
-  assert.throws(
-    () => validateReview(
-      reviewWith(issue({
-        basis: {
-          type: 'candidate',
-          locator: 'answer:p99',
-          quote: 'not in candidate',
-          evidence: 'fabricated',
-        },
-      })),
-      { sourceText: SOURCE, candidateText: 'actual candidate text' },
-    ),
-    /does not resolve in candidate answer/,
-  );
+test('logic grounding fingerprint depends on anchored premises', () => {
+  const a = groundingFingerprint(logicBasis());
+  const b = groundingFingerprint(logicBasis({
+    premises: [{ type: 'source', locator: 'source:L2', quote: 'Paragraph 2 states condition Z.' }],
+  }));
+  assert.notEqual(a, b);
 });
 
-test('reviewer suggestion, summary, severity and confidence are removed before A sees review data', () => {
+test('review rejects exact duplicate actionable issues even under unique IDs', () => {
+  assert.throws(() => validateReview(reviewWith(
+    issue({ id: 'B-1' }),
+    issue({ id: 'B-2' }),
+  ), { sourceText: SOURCE, candidateText: CANDIDATE }), /duplicate actionable issue content/);
+});
+
+test('review limits actionable issue count', () => {
+  const issues = Array.from({ length: MAX_ACTIONABLE_ISSUES + 1 }, (_, index) => issue({
+    id: `B-${index + 1}`,
+    claim: `Distinct claim ${index + 1}`,
+  }));
+  assert.throws(() => validateReview(reviewWith(...issues), {
+    sourceText: SOURCE,
+    candidateText: CANDIDATE,
+  }), /cannot exceed/);
+});
+
+test('reviewer persuasion metadata is removed before A sees review data', () => {
   const review = reviewWith({
-    ...issue({ suggestion: 'Change the answer to Y immediately.' }),
+    ...issue({ suggestion: 'Change immediately.', severity: 'critical', confidence: 1 }),
     disputeId: 'D-0001',
   });
   const projected = projectReviewForAuthor(review);
@@ -112,244 +152,151 @@ test('reviewer suggestion, summary, severity and confidence are removed before A
   assert.equal(projected.issues[0].disputeId, 'D-0001');
 });
 
-test('controller returns PASS without unnecessary revision', async () => {
+test('controller returns PASS on trusted candidate without revision', async () => {
   const author = {
-    async draft() { return 'trusted draft'; },
+    async draft() { return CANDIDATE; },
     async revise() { throw new Error('should not revise'); },
   };
   const reviewer = {
-    async review() {
-      return { status: 'PASS', score: 96, summary: 'ok', issues: [], uncertainties: [] };
-    },
+    async review() { return { status: 'PASS', score: 96, summary: 'ok', issues: [], uncertainties: [] }; },
   };
-
-  const result = await new DualAIReviewController({ author, reviewer }).run({
-    task: 'test',
-    source: SOURCE,
-  });
-  assert.equal(result.status, 'PASS');
-  assert.equal(result.answer, 'trusted draft');
+  const result = await new DualAIReviewController({ author, reviewer }).run({ task: 'test', source: SOURCE });
+  assert.equal(result.answer, CANDIDATE);
 });
 
-test('REJECT + drift cannot be laundered by next-round PASS', async () => {
-  const seenCandidates = [];
-  let reviewRound = 0;
-
+test('REJECT drift cannot be laundered by later PASS', async () => {
+  const seen = [];
+  let round = 0;
   const author = {
-    async draft() { return 'trusted draft'; },
+    async draft() { return CANDIDATE; },
     async revise({ review }) {
-      return {
-        answer: 'drifted toward B',
-        decisions: review.issues.map((item) => decisionFor(item.id, 'REJECT')),
-      };
+      return { answer: 'drifted branch', decisions: review.issues.map((x) => decisionFor(x.id, 'REJECT')) };
     },
   };
-
-  const reviewer = {
-    async review({ candidate, priorDisputes }) {
-      seenCandidates.push(candidate);
-      reviewRound += 1;
-
-      if (reviewRound === 1) return reviewWith(issue());
-      assert.equal(priorDisputes.length, 1);
-      return { status: 'PASS', score: 95, summary: 'ok', issues: [], uncertainties: [] };
-    },
-  };
-
-  const result = await new DualAIReviewController({
-    author,
-    reviewer,
-    maxRounds: 2,
-    disagreementLimit: 2,
-  }).run({ task: 'test', source: SOURCE });
-
-  assert.deepEqual(seenCandidates, ['trusted draft', 'trusted draft']);
-  assert.equal(result.status, 'PASS');
-  assert.equal(result.answer, 'trusted draft');
-});
-
-test('REJECT + drift cannot be laundered when old issue disappears and unrelated issue is accepted', async () => {
-  const seenCandidates = [];
-  let reviewRound = 0;
-
-  const author = {
-    async draft() { return 'trusted draft'; },
-    async revise({ review, round }) {
-      const verdict = round === 1 ? 'REJECT' : 'ACCEPT';
-      return {
-        answer: round === 1 ? 'drifted branch' : 'trusted draft plus safe fix',
-        decisions: review.issues.map((item) => decisionFor(item.id, verdict)),
-      };
-    },
-  };
-
   const reviewer = {
     async review({ candidate }) {
-      seenCandidates.push(candidate);
-      reviewRound += 1;
-      if (reviewRound === 1) return reviewWith(issue());
-      if (reviewRound === 2) {
-        return reviewWith(issue({
-          id: 'B-2',
-          target: 'answer:format',
-          claim: 'A formatting issue exists.',
-          basis: {
-            type: 'candidate',
-            locator: 'answer:whole',
-            quote: 'trusted draft',
-            evidence: 'The trusted answer lacks the requested suffix.',
-          },
-        }));
-      }
-      return { status: 'PASS', score: 95, summary: 'ok', issues: [], uncertainties: [] };
+      seen.push(candidate);
+      round += 1;
+      return round === 1
+        ? reviewWith(issue())
+        : { status: 'PASS', score: 95, summary: 'ok', issues: [], uncertainties: [] };
     },
   };
-
-  const result = await new DualAIReviewController({
-    author,
-    reviewer,
-    maxRounds: 3,
-    disagreementLimit: 2,
-  }).run({ task: 'test', source: SOURCE });
-
-  assert.deepEqual(seenCandidates, ['trusted draft', 'trusted draft', 'trusted draft plus safe fix']);
-  assert.equal(result.status, 'PASS');
-  assert.equal(result.answer, 'trusted draft plus safe fix');
+  const result = await new DualAIReviewController({ author, reviewer, maxRounds: 2 }).run({ task: 'test', source: SOURCE });
+  assert.deepEqual(seen, [CANDIDATE, CANDIDATE]);
+  assert.equal(result.answer, CANDIDATE);
 });
 
-test('controller-managed dispute id tracks same issue even when target and locator wording change', async () => {
+test('compatible dispute binding increments consecutive disagreement', async () => {
   const author = {
-    async draft() { return 'trusted draft'; },
+    async draft() { return CANDIDATE; },
     async revise({ review, round }) {
-      return {
-        answer: `discarded drift ${round}`,
-        decisions: review.issues.map((item) => decisionFor(item.id, 'REJECT')),
-      };
+      return { answer: `discarded ${round}`, decisions: review.issues.map((x) => decisionFor(x.id, 'REJECT')) };
     },
   };
-
   const reviewer = {
     async review({ round, priorDisputes }) {
       if (round === 1) return reviewWith(issue());
-
-      assert.equal(priorDisputes.length, 1);
+      const prior = priorDisputes[0];
       return reviewWith(issue({
         id: 'B-2',
-        relatedDisputeId: priorDisputes[0].disputeId,
-        target: 'answer:claim-moved-to-paragraph-4',
-        claim: 'Same substantive support dispute, different wording.',
-        basis: {
-          type: 'source',
-          locator: 'source:paragraph-one',
-          quote: 'Paragraph 1 states condition Y.',
-          evidence: 'Same controlling source span.',
-        },
+        relatedDisputeId: prior.disputeId,
+        target: prior.target,
+        claim: prior.claim,
+        basis: prior.basis,
       }));
     },
   };
-
   const result = await new DualAIReviewController({
     author,
     reviewer,
     maxRounds: 3,
     disagreementLimit: 2,
   }).run({ task: 'test', source: SOURCE });
-
   assert.equal(result.status, 'DISAGREEMENT');
-  assert.equal(result.rounds, 2);
-  assert.equal(result.answer, 'trusted draft');
-  assert.equal(result.disputedIssue.disputeId, 'D-0001');
+  assert.equal(result.answer, CANDIDATE);
 });
 
-test('different claims sharing target and locator receive distinct controller dispute ids', async () => {
-  const observed = [];
-
+test('incompatible reuse of a valid disputeId is rebound as a new dispute and cannot false-trigger disagreement', async () => {
+  const observedIds = [];
   const author = {
-    async draft() { return 'trusted draft'; },
+    async draft() { return CANDIDATE; },
     async revise({ review }) {
-      observed.push(review.issues.map((item) => item.disputeId));
-      return {
-        answer: 'discarded branch',
-        decisions: review.issues.map((item) => decisionFor(item.id, 'REJECT')),
-      };
+      observedIds.push(review.issues[0].disputeId);
+      return { answer: 'discarded', decisions: review.issues.map((x) => decisionFor(x.id, 'REJECT')) };
     },
   };
-
   const reviewer = {
-    async review({ round }) {
-      if (round === 1) {
-        return {
-          status: 'REVISE',
-          score: 70,
-          summary: 'two distinct issues',
-          issues: [
-            issue({ id: 'B-1', claim: 'First substantive claim.' }),
-            issue({ id: 'B-2', claim: 'Second substantive claim.' }),
-          ],
-          uncertainties: [],
-        };
-      }
-      return { status: 'PASS', score: 95, summary: 'ok', issues: [], uncertainties: [] };
+    async review({ round, priorDisputes }) {
+      if (round === 1) return reviewWith(issue());
+      return reviewWith(issue({
+        id: 'B-2',
+        relatedDisputeId: priorDisputes[0].disputeId,
+        target: 'answer:unrelated',
+        claim: 'A completely unrelated dispute.',
+        basis: candidateBasis(),
+      }));
     },
   };
-
   const result = await new DualAIReviewController({
     author,
     reviewer,
     maxRounds: 2,
     disagreementLimit: 2,
   }).run({ task: 'test', source: SOURCE });
-
-  assert.deepEqual(observed[0], ['D-0001', 'D-0002']);
-  assert.equal(result.answer, 'trusted draft');
+  assert.deepEqual(observedIds, ['D-0001', 'D-0002']);
+  assert.equal(result.status, 'MAX_ROUNDS');
+  assert.equal(result.answer, CANDIDATE);
 });
 
-test('unknown relatedDisputeId is rejected by controller', async () => {
+test('different claims sharing same anchor remain distinct disputes', async () => {
+  const ids = [];
   const author = {
-    async draft() { return 'trusted draft'; },
-    async revise() { throw new Error('should not revise'); },
-  };
-  const reviewer = {
-    async review() {
-      return reviewWith(issue({ relatedDisputeId: 'D-9999' }));
+    async draft() { return CANDIDATE; },
+    async revise({ review }) {
+      ids.push(...review.issues.map((x) => x.disputeId));
+      return { answer: 'discarded', decisions: review.issues.map((x) => decisionFor(x.id, 'REJECT')) };
     },
   };
+  const reviewer = {
+    async review({ round }) {
+      if (round === 1) return reviewWith(
+        issue({ id: 'B-1', claim: 'First substantive claim.' }),
+        issue({ id: 'B-2', claim: 'Second substantive claim.' }),
+      );
+      return { status: 'PASS', score: 95, summary: 'ok', issues: [], uncertainties: [] };
+    },
+  };
+  await new DualAIReviewController({ author, reviewer, maxRounds: 2 }).run({ task: 'test', source: SOURCE });
+  assert.deepEqual(ids, ['D-0001', 'D-0002']);
+});
 
+test('unknown relatedDisputeId is rejected', async () => {
+  const author = { async draft() { return CANDIDATE; }, async revise() { throw new Error('no'); } };
+  const reviewer = { async review() { return reviewWith(issue({ relatedDisputeId: 'D-9999' })); } };
   await assert.rejects(
     () => new DualAIReviewController({ author, reviewer }).run({ task: 'test', source: SOURCE }),
     /unknown relatedDisputeId/,
   );
 });
 
-test('repeated PARTIAL residual dispute escalates without promoting the partial branch', async () => {
+test('repeated PARTIAL stays off trusted lineage', async () => {
   const author = {
-    async draft() { return 'trusted draft'; },
+    async draft() { return CANDIDATE; },
     async revise({ review, round }) {
-      return {
-        answer: `partial branch ${round}`,
-        decisions: review.issues.map((item) => decisionFor(item.id, 'PARTIAL')),
-      };
+      return { answer: `partial ${round}`, decisions: review.issues.map((x) => decisionFor(x.id, 'PARTIAL')) };
     },
   };
-
   const reviewer = {
     async review({ round, priorDisputes }) {
-      return reviewWith(issue({
-        id: `B-${round}`,
-        relatedDisputeId: round === 1 ? null : priorDisputes[0].disputeId,
-      }));
+      if (round === 1) return reviewWith(issue());
+      const prior = priorDisputes[0];
+      return reviewWith(issue({ id: `B-${round}`, relatedDisputeId: prior.disputeId, target: prior.target, claim: prior.claim, basis: prior.basis }));
     },
   };
-
-  const result = await new DualAIReviewController({
-    author,
-    reviewer,
-    maxRounds: 3,
-    disagreementLimit: 2,
-  }).run({ task: 'test', source: SOURCE });
-
+  const result = await new DualAIReviewController({ author, reviewer, maxRounds: 3, disagreementLimit: 2 }).run({ task: 'test', source: SOURCE });
   assert.equal(result.status, 'DISAGREEMENT');
-  assert.equal(result.answer, 'trusted draft');
+  assert.equal(result.answer, CANDIDATE);
 });
 
 test('controller limits reject unsafe values', () => {

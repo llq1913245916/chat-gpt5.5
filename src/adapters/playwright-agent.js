@@ -33,8 +33,31 @@ export function validateTransportConfig(config) {
   }
 }
 
-export async function waitForCompletionSignal({
+export function armGenerationLifecycle({
   page,
+  completion = {},
+  timeoutMs,
+  name = 'agent',
+}) {
+  if (!completion.generatingSelector) return null;
+  const generating = page.locator(completion.generatingSelector).first();
+
+  return (async () => {
+    await generating.waitFor({
+      state: 'hidden',
+      timeout: completion.idleTimeoutMs ?? 3000,
+    });
+    await generating.waitFor({
+      state: 'visible',
+      timeout: completion.startTimeoutMs ?? 10000,
+    });
+    await generating.waitFor({ state: 'hidden', timeout: timeoutMs });
+    return { ok: true };
+  })().catch((error) => ({ ok: false, error, name }));
+}
+
+export async function resolveGenerationLifecycle({
+  watch,
   response,
   completion = {},
   responseStableMs,
@@ -42,35 +65,15 @@ export async function waitForCompletionSignal({
   waitForStableText,
   name = 'agent',
 }) {
-  if (completion.generatingSelector) {
-    const generating = page.locator(completion.generatingSelector).first();
+  if (!watch) return;
+  const result = await watch;
+  if (result.ok) return;
 
-    try {
-      await generating.waitFor({
-        state: 'visible',
-        timeout: completion.startTimeoutMs ?? 10000,
-      });
-    } catch (error) {
-      if (completion.allowMissingGenerationStart !== true) {
-        throw new Error(
-          `${name} generation-start signal was not observed; refusing to return a potentially partial response`,
-          { cause: error },
-        );
-      }
-      await waitForStableText(response, responseStableMs, timeoutMs);
-      return;
-    }
-
-    await generating.waitFor({ state: 'hidden', timeout: timeoutMs });
-    return;
-  }
-
-  if (completion.doneSelector) {
-    await response.locator(completion.doneSelector).first().waitFor({
-      state: 'visible',
-      timeout: timeoutMs,
-    });
-    return;
+  if (completion.allowMissingGenerationStart !== true) {
+    throw new Error(
+      `${name} generation lifecycle was not observed; refusing to return a potentially partial response`,
+      { cause: result.error },
+    );
   }
 
   await waitForStableText(response, responseStableMs, timeoutMs);
@@ -88,9 +91,78 @@ export function validateAssistantNodeDelta({
   }
   if (requireSingleAssistantNode && delta !== 1) {
     throw new Error(
-      `${name} produced ${delta} assistant nodes; configure assistantMessage to identify exactly one final response container per turn`,
+      `${name} produced ${delta} assistant nodes; configure assistantMessage to identify exactly one response container per turn`,
     );
   }
+}
+
+export async function sendChatTurn({
+  page,
+  selectors,
+  completion = {},
+  message,
+  responseStableMs,
+  timeoutMs,
+  waitForStableText,
+  name = 'agent',
+}) {
+  const messages = page.locator(selectors.assistantMessage);
+  const beforeCount = await messages.count();
+  const input = page.locator(selectors.input).first();
+  await input.fill(message);
+
+  const generationWatch = completion.generatingSelector
+    ? armGenerationLifecycle({ page, completion, timeoutMs, name })
+    : null;
+
+  if (selectors.send) {
+    await page.locator(selectors.send).first().click();
+  } else {
+    await input.press('Enter');
+  }
+
+  if (generationWatch) {
+    const provisionalResponse = messages.nth(beforeCount);
+    await resolveGenerationLifecycle({
+      watch: generationWatch,
+      response: provisionalResponse,
+      completion,
+      responseStableMs,
+      timeoutMs,
+      waitForStableText,
+      name,
+    });
+  }
+
+  await page.waitForFunction(
+    ({ selector, before }) => document.querySelectorAll(selector).length > before,
+    { selector: selectors.assistantMessage, before: beforeCount },
+    { timeout: timeoutMs },
+  );
+
+  const response = messages.nth(beforeCount);
+  await response.waitFor({ state: 'visible' });
+
+  if (completion.doneSelector) {
+    await response.locator(completion.doneSelector).first().waitFor({
+      state: 'visible',
+      timeout: timeoutMs,
+    });
+  } else if (!generationWatch) {
+    await waitForStableText(response, responseStableMs, timeoutMs);
+  }
+
+  const afterCount = await messages.count();
+  validateAssistantNodeDelta({
+    beforeCount,
+    afterCount,
+    requireSingleAssistantNode: completion.requireSingleAssistantNode !== false,
+    name,
+  });
+
+  const text = (await response.innerText()).trim();
+  if (!text) throw new Error(`${name} returned an empty assistant response`);
+  return text;
 }
 
 export class PlaywrightChatAgent {
@@ -138,54 +210,17 @@ export class PlaywrightChatAgent {
 
   async send(message) {
     if (!this.page || !this.sessionId) throw new Error('Agent session is not started');
-    const {
-      selectors,
-      completion = {},
-      responseStableMs,
-      timeoutMs,
-    } = this.config;
-
-    const messages = this.page.locator(selectors.assistantMessage);
-    const beforeCount = await messages.count();
-    const input = this.page.locator(selectors.input).first();
-    await input.fill(message);
-
-    if (selectors.send) {
-      await this.page.locator(selectors.send).first().click();
-    } else {
-      await input.press('Enter');
-    }
-
-    await this.page.waitForFunction(
-      ({ selector, before }) => document.querySelectorAll(selector).length > before,
-      { selector: selectors.assistantMessage, before: beforeCount },
-      { timeout: timeoutMs },
-    );
-
-    const response = messages.nth(beforeCount);
-    await response.waitFor({ state: 'visible' });
-
-    await waitForCompletionSignal({
+    const { selectors, completion = {}, responseStableMs, timeoutMs } = this.config;
+    return sendChatTurn({
       page: this.page,
-      response,
+      selectors,
       completion,
+      message,
       responseStableMs,
       timeoutMs,
       waitForStableText: this.#waitForStableText.bind(this),
       name: this.config.name || 'agent',
     });
-
-    const afterCount = await messages.count();
-    validateAssistantNodeDelta({
-      beforeCount,
-      afterCount,
-      requireSingleAssistantNode: completion.requireSingleAssistantNode !== false,
-      name: this.config.name || 'agent',
-    });
-
-    const text = (await response.innerText()).trim();
-    if (!text) throw new Error(`${this.config.name || 'agent'} returned an empty assistant response`);
-    return text;
   }
 
   async #waitForStableText(locator, stableMs, timeoutMs) {

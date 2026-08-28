@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import {
   REVIEW_STATUS,
+  groundingFingerprint,
+  normalizeProtocolText,
   validateControllerLimits,
   validateReview,
   validateRevision,
@@ -19,17 +21,29 @@ function isUnresolvedDecision(decision) {
     || (decision.verdict === 'PARTIAL' && decision.residualDispute === true);
 }
 
+function continuityRecord(issue) {
+  return {
+    target: normalizeProtocolText(issue.target),
+    claim: normalizeProtocolText(issue.claim),
+    grounding: groundingFingerprint(issue.basis),
+  };
+}
+
+function isCompatibleRelatedIssue(issue, state) {
+  const current = continuityRecord(issue);
+  return current.target === state.continuity.target
+    && current.claim === state.continuity.claim
+    && current.grounding === state.continuity.grounding;
+}
+
 function publicDisputeRegistry(registry) {
   return [...registry.values()]
     .filter((state) => state.lastUnresolved === true)
     .map((state) => ({
       disputeId: state.disputeId,
-      target: state.issue.target,
-      claim: state.issue.claim,
-      basis: {
-        type: state.issue.basis.type,
-        locator: state.issue.basis.locator,
-      },
+      target: state.continuity.target,
+      claim: state.continuity.claim,
+      basis: state.canonicalIssue.basis,
     }));
 }
 
@@ -53,6 +67,12 @@ export class DualAIReviewController {
     const sessionId = this.store ? await this.store.createSession(truth) : randomUUID();
     const disputeRegistry = new Map();
     let nextDisputeNumber = 1;
+
+    const allocateDisputeId = () => {
+      const id = `D-${String(nextDisputeNumber).padStart(4, '0')}`;
+      nextDisputeNumber += 1;
+      return id;
+    };
 
     let version = 0;
     let current = normalizeDraft(await this.author.draft({ truth, round: 0, sessionId }));
@@ -89,18 +109,29 @@ export class DualAIReviewController {
       const boundReview = {
         ...review,
         issues: review.issues.map((issue) => {
-          let disputeId = issue.relatedDisputeId ?? null;
+          const requestedDisputeId = issue.relatedDisputeId ?? null;
+          let disputeId = requestedDisputeId;
+          let bindingRejectedFrom;
 
-          if (disputeId) {
-            if (!disputeRegistry.has(disputeId)) {
-              throw new Error(`Protocol error: unknown relatedDisputeId: ${disputeId}`);
+          if (requestedDisputeId) {
+            const state = disputeRegistry.get(requestedDisputeId);
+            if (!state) {
+              throw new Error(`Protocol error: unknown relatedDisputeId: ${requestedDisputeId}`);
+            }
+
+            if (!isCompatibleRelatedIssue(issue, state)) {
+              bindingRejectedFrom = requestedDisputeId;
+              disputeId = allocateDisputeId();
             }
           } else {
-            disputeId = `D-${String(nextDisputeNumber).padStart(4, '0')}`;
-            nextDisputeNumber += 1;
+            disputeId = allocateDisputeId();
           }
 
-          return { ...issue, disputeId };
+          return {
+            ...issue,
+            disputeId,
+            ...(bindingRejectedFrom ? { bindingRejectedFrom } : {}),
+          };
         }),
       };
 
@@ -111,8 +142,6 @@ export class DualAIReviewController {
 
       await this.store?.recordReview(sessionId, round, boundReview);
 
-      // Invariant: current is always a trusted checkpoint.
-      // Therefore a PASS can never launder a disputed descendant.
       if (boundReview.status === REVIEW_STATUS.PASS) {
         return this.#finish(sessionId, {
           status: 'PASS',
@@ -161,6 +190,8 @@ export class DualAIReviewController {
 
         disputeRegistry.set(disputeId, {
           disputeId,
+          canonicalIssue: previous?.canonicalIssue ?? issue,
+          continuity: previous?.continuity ?? continuityRecord(issue),
           lastSeenRound: round,
           lastVerdict: decision.verdict,
           lastUnresolved: unresolved,
@@ -206,18 +237,12 @@ export class DualAIReviewController {
           disputedRevision: proposed.answer,
           disputedVersion: version,
           disputedIssue: repeatedDispute.issue,
-          message: 'The same controller-managed dispute remains unresolved across consecutive rounds. Returning the last trusted checkpoint; the disputed branch is never promoted automatically.',
+          message: 'The same mechanically continuous dispute remains unresolved across consecutive rounds. Returning the last trusted checkpoint; incompatible dispute-ID rebindings never increment this counter.',
         });
       }
 
       if (hasUnresolvedDispute) {
-        // Fail-safe: do not continue from a descendant of a rejected/partial critique.
-        // The next reviewer round receives the unchanged trusted checkpoint plus the
-        // controller-managed prior dispute registry.
-        latestDisputed = {
-          version,
-          answer: proposed.answer,
-        };
+        latestDisputed = { version, answer: proposed.answer };
         continue;
       }
 

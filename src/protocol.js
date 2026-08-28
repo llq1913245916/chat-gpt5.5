@@ -7,6 +7,8 @@ export const VERDICTS = new Set(['ACCEPT', 'REJECT', 'PARTIAL']);
 export const SEVERITIES = new Set(['critical', 'major', 'minor']);
 export const BASIS_TYPES = new Set(['source', 'candidate', 'logic']);
 export const MAX_ROUNDS_HARD_LIMIT = 12;
+export const MAX_ACTIONABLE_ISSUES = 8;
+export const MAX_LOGIC_PREMISES = 4;
 
 function assert(condition, message) {
   if (!condition) throw new Error(`Protocol error: ${message}`);
@@ -16,14 +18,54 @@ function nonEmptyString(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function normalizeText(value) {
+export function normalizeProtocolText(value) {
   return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
+function normalizeFingerprintText(value) {
+  return normalizeProtocolText(value).toLowerCase();
+}
+
+function lineRangeFor(locator, expectedPrefix, label) {
+  const match = /^(source|candidate):L(\d+)(?:-L?(\d+))?$/i.exec(String(locator ?? '').trim());
+  assert(match, `${label}.locator must use ${expectedPrefix}:Lx or ${expectedPrefix}:Lx-Ly`);
+  assert(match[1].toLowerCase() === expectedPrefix, `${label}.locator must use ${expectedPrefix}: prefix`);
+
+  const start = Number(match[2]);
+  const end = Number(match[3] ?? match[2]);
+  assert(Number.isInteger(start) && start >= 1, `${label}.locator start line must be >= 1`);
+  assert(Number.isInteger(end) && end >= start, `${label}.locator end line must be >= start line`);
+  return { start, end };
+}
+
+function textAtLineRange(text, range, label) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  assert(range.end <= lines.length, `${label}.locator does not resolve in supplied text`);
+  return lines.slice(range.start - 1, range.end).join('\n');
+}
+
 function quoteExists(haystack, quote) {
-  const normalizedHaystack = normalizeText(haystack);
-  const normalizedQuote = normalizeText(quote);
+  const normalizedHaystack = normalizeProtocolText(haystack);
+  const normalizedQuote = normalizeProtocolText(quote);
   return normalizedQuote.length > 0 && normalizedHaystack.includes(normalizedQuote);
+}
+
+function validateQuotedAnchor(anchor, label, { sourceText = '', candidateText = '' } = {}) {
+  assert(anchor && typeof anchor === 'object' && !Array.isArray(anchor), `${label} must be an object`);
+  assert(anchor.type === 'source' || anchor.type === 'candidate', `${label}.type must be source or candidate`);
+  assert(nonEmptyString(anchor.locator), `${label}.locator is required`);
+  assert(nonEmptyString(anchor.quote), `${label}.quote is required`);
+
+  const text = anchor.type === 'source' ? sourceText : candidateText;
+  assert(nonEmptyString(text), `${label}.type=${anchor.type} requires supplied ${anchor.type} text`);
+
+  const range = lineRangeFor(anchor.locator, anchor.type, label);
+  const scopedText = textAtLineRange(text, range, label);
+  assert(
+    quoteExists(scopedText, anchor.quote),
+    `${label}.quote does not resolve at ${anchor.locator}`,
+  );
+  return anchor;
 }
 
 export function validateBasis(
@@ -31,40 +73,52 @@ export function validateBasis(
   label,
   { sourceText = '', candidateText = '' } = {},
 ) {
-  assert(
-    basis && typeof basis === 'object' && !Array.isArray(basis),
-    `${label}.basis must be an object`,
-  );
-  assert(
-    BASIS_TYPES.has(basis.type),
-    `${label}.basis.type must be source, candidate, or logic`,
-  );
+  assert(basis && typeof basis === 'object' && !Array.isArray(basis), `${label}.basis must be an object`);
+  assert(BASIS_TYPES.has(basis.type), `${label}.basis.type must be source, candidate, or logic`);
   assert(nonEmptyString(basis.locator), `${label}.basis.locator is required`);
   assert(nonEmptyString(basis.evidence), `${label}.basis.evidence is required`);
 
-  if (basis.type === 'source') {
-    assert(nonEmptyString(sourceText), `${label}.basis.type=source requires a Source of Truth`);
-    assert(nonEmptyString(basis.quote), `${label}.basis.quote is required for source grounding`);
-    assert(
-      quoteExists(sourceText, basis.quote),
-      `${label}.basis.quote does not resolve in Source of Truth`,
-    );
+  if (basis.type === 'source' || basis.type === 'candidate') {
+    validateQuotedAnchor(basis, `${label}.basis`, { sourceText, candidateText });
   }
 
-  if (basis.type === 'candidate') {
-    assert(nonEmptyString(candidateText), `${label}.basis.type=candidate requires a candidate answer`);
-    assert(nonEmptyString(basis.quote), `${label}.basis.quote is required for candidate grounding`);
+  if (basis.type === 'logic') {
+    assert(Array.isArray(basis.premises), `${label}.basis.premises is required for logic grounding`);
     assert(
-      quoteExists(candidateText, basis.quote),
-      `${label}.basis.quote does not resolve in candidate answer`,
+      basis.premises.length >= 1 && basis.premises.length <= MAX_LOGIC_PREMISES,
+      `${label}.basis.premises must contain 1..${MAX_LOGIC_PREMISES} grounded premises`,
     );
-  }
-
-  if (basis.type === 'logic' && basis.quote !== undefined) {
-    assert(typeof basis.quote === 'string', `${label}.basis.quote must be a string when present`);
+    basis.premises.forEach((premise, index) => {
+      validateQuotedAnchor(premise, `${label}.basis.premises[${index}]`, { sourceText, candidateText });
+    });
   }
 
   return basis;
+}
+
+export function groundingFingerprint(basis) {
+  if (basis.type === 'source' || basis.type === 'candidate') {
+    return [
+      basis.type,
+      normalizeFingerprintText(basis.locator),
+      normalizeFingerprintText(basis.quote),
+    ].join('|');
+  }
+
+  const premises = (basis.premises ?? []).map((premise) => [
+    premise.type,
+    normalizeFingerprintText(premise.locator),
+    normalizeFingerprintText(premise.quote),
+  ].join('|'));
+  return ['logic', normalizeFingerprintText(basis.locator), ...premises].join('||');
+}
+
+export function issueFingerprint(issue) {
+  return [
+    normalizeFingerprintText(issue.target),
+    normalizeFingerprintText(issue.claim),
+    groundingFingerprint(issue.basis),
+  ].join('|||');
 }
 
 export function validateReview(
@@ -76,6 +130,7 @@ export function validateReview(
   assert(Number.isFinite(input.score) && input.score >= 0 && input.score <= 100, 'score must be 0..100');
   assert(nonEmptyString(input.summary), 'summary is required');
   assert(Array.isArray(input.issues), 'issues must be an array');
+  assert(input.issues.length <= MAX_ACTIONABLE_ISSUES, `issues cannot exceed ${MAX_ACTIONABLE_ISSUES} actionable items per round`);
 
   if (input.status === REVIEW_STATUS.PASS) {
     assert(input.issues.length === 0, 'PASS cannot contain actionable issues');
@@ -85,6 +140,7 @@ export function validateReview(
 
   const seenIds = new Set();
   const relatedIds = new Set();
+  const seenFingerprints = new Set();
 
   for (const issue of input.issues) {
     assert(issue && typeof issue === 'object', 'each issue must be an object');
@@ -93,37 +149,28 @@ export function validateReview(
     seenIds.add(issue.id);
 
     assert(SEVERITIES.has(issue.severity), `invalid severity for ${issue.id}`);
-    assert(
-      Number.isFinite(issue.confidence) && issue.confidence >= 0 && issue.confidence <= 1,
-      `confidence must be 0..1 for ${issue.id}`,
-    );
+    assert(Number.isFinite(issue.confidence) && issue.confidence >= 0 && issue.confidence <= 1, `confidence must be 0..1 for ${issue.id}`);
     assert(nonEmptyString(issue.target), `target is required for ${issue.id}`);
     assert(nonEmptyString(issue.claim), `claim is required for ${issue.id}`);
     assert(nonEmptyString(issue.suggestion), `suggestion is required for ${issue.id}`);
 
     if (issue.relatedDisputeId !== null && issue.relatedDisputeId !== undefined) {
-      assert(
-        nonEmptyString(issue.relatedDisputeId),
-        `relatedDisputeId must be null or non-empty for ${issue.id}`,
-      );
-      assert(
-        !relatedIds.has(issue.relatedDisputeId),
-        `duplicate relatedDisputeId in one review: ${issue.relatedDisputeId}`,
-      );
+      assert(nonEmptyString(issue.relatedDisputeId), `relatedDisputeId must be null or non-empty for ${issue.id}`);
+      assert(!relatedIds.has(issue.relatedDisputeId), `duplicate relatedDisputeId in one review: ${issue.relatedDisputeId}`);
       relatedIds.add(issue.relatedDisputeId);
     }
 
     validateBasis(issue.basis, `issue ${issue.id}`, { sourceText, candidateText });
+    const fingerprint = issueFingerprint(issue);
+    assert(!seenFingerprints.has(fingerprint), `duplicate actionable issue content: ${issue.id}`);
+    seenFingerprints.add(fingerprint);
   }
 
   if (input.uncertainties !== undefined) {
     assert(Array.isArray(input.uncertainties), 'uncertainties must be an array when present');
   }
 
-  return {
-    ...input,
-    uncertainties: input.uncertainties ?? [],
-  };
+  return { ...input, uncertainties: input.uncertainties ?? [] };
 }
 
 export function validateRevision(
@@ -147,37 +194,22 @@ export function validateRevision(
     assert(VERDICTS.has(decision.verdict), `invalid verdict for ${decision.issueId}`);
     assert(nonEmptyString(decision.reason), `reason is required for ${decision.issueId}`);
     validateBasis(decision.basis, `decision ${decision.issueId}`, { sourceText, candidateText });
-    assert(
-      typeof decision.residualDispute === 'boolean',
-      `residualDispute is required for ${decision.issueId}`,
-    );
+    assert(typeof decision.residualDispute === 'boolean', `residualDispute is required for ${decision.issueId}`);
 
     if (decision.verdict === 'ACCEPT') {
-      assert(
-        decision.residualDispute === false,
-        `ACCEPT cannot retain residualDispute for ${decision.issueId}`,
-      );
+      assert(decision.residualDispute === false, `ACCEPT cannot retain residualDispute for ${decision.issueId}`);
     }
     if (decision.verdict === 'REJECT') {
-      assert(
-        decision.residualDispute === true,
-        `REJECT must retain residualDispute for ${decision.issueId}`,
-      );
+      assert(decision.residualDispute === true, `REJECT must retain residualDispute for ${decision.issueId}`);
     }
     if (decision.verdict === 'PARTIAL') {
       assert(nonEmptyString(decision.acceptedPart), `PARTIAL requires acceptedPart for ${decision.issueId}`);
       assert(nonEmptyString(decision.rejectedPart), `PARTIAL requires rejectedPart for ${decision.issueId}`);
-      assert(
-        decision.residualDispute === true,
-        `PARTIAL must retain residualDispute for ${decision.issueId}`,
-      );
+      assert(decision.residualDispute === true, `PARTIAL must retain residualDispute for ${decision.issueId}`);
     }
   }
 
-  for (const id of requiredIds) {
-    assert(decidedIds.has(id), `missing decision for issue: ${id}`);
-  }
-
+  for (const id of requiredIds) assert(decidedIds.has(id), `missing decision for issue: ${id}`);
   return input;
 }
 
@@ -196,14 +228,8 @@ export function projectReviewForAuthor(review) {
 
 export function validateControllerLimits({ maxRounds, disagreementLimit }) {
   assert(Number.isInteger(maxRounds) && Number.isFinite(maxRounds), 'maxRounds must be a finite integer');
-  assert(
-    maxRounds >= 1 && maxRounds <= MAX_ROUNDS_HARD_LIMIT,
-    `maxRounds must be 1..${MAX_ROUNDS_HARD_LIMIT}`,
-  );
-  assert(
-    Number.isInteger(disagreementLimit) && Number.isFinite(disagreementLimit),
-    'disagreementLimit must be a finite integer',
-  );
+  assert(maxRounds >= 1 && maxRounds <= MAX_ROUNDS_HARD_LIMIT, `maxRounds must be 1..${MAX_ROUNDS_HARD_LIMIT}`);
+  assert(Number.isInteger(disagreementLimit) && Number.isFinite(disagreementLimit), 'disagreementLimit must be a finite integer');
   assert(disagreementLimit >= 1, 'disagreementLimit must be >= 1');
   assert(disagreementLimit <= maxRounds, 'disagreementLimit cannot exceed maxRounds');
 }
@@ -211,15 +237,10 @@ export function validateControllerLimits({ maxRounds, disagreementLimit }) {
 export function parseJsonObject(text) {
   if (typeof text !== 'string') return text;
   const trimmed = text.trim();
-
   try {
     return JSON.parse(trimmed);
   } catch {
-    const unfenced = trimmed
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/\s*```$/i, '')
-      .trim();
-
+    const unfenced = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     try {
       return JSON.parse(unfenced);
     } catch {
