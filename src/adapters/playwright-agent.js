@@ -24,6 +24,73 @@ export function validateTransportConfig(config) {
   if (!hasAuthoritativeCompletion && completion.allowStabilityFallback !== true) {
     throw new Error(`${name} must configure an authoritative completion signal or explicitly allow the unsafe stability fallback`);
   }
+  if (
+    completion.generatingSelector
+    && completion.allowMissingGenerationStart === true
+    && completion.allowStabilityFallback !== true
+  ) {
+    throw new Error(`${name} allowMissingGenerationStart requires allowStabilityFallback=true`);
+  }
+}
+
+export async function waitForCompletionSignal({
+  page,
+  response,
+  completion = {},
+  responseStableMs,
+  timeoutMs,
+  waitForStableText,
+  name = 'agent',
+}) {
+  if (completion.generatingSelector) {
+    const generating = page.locator(completion.generatingSelector).first();
+
+    try {
+      await generating.waitFor({
+        state: 'visible',
+        timeout: completion.startTimeoutMs ?? 10000,
+      });
+    } catch (error) {
+      if (completion.allowMissingGenerationStart !== true) {
+        throw new Error(
+          `${name} generation-start signal was not observed; refusing to return a potentially partial response`,
+          { cause: error },
+        );
+      }
+      await waitForStableText(response, responseStableMs, timeoutMs);
+      return;
+    }
+
+    await generating.waitFor({ state: 'hidden', timeout: timeoutMs });
+    return;
+  }
+
+  if (completion.doneSelector) {
+    await response.locator(completion.doneSelector).first().waitFor({
+      state: 'visible',
+      timeout: timeoutMs,
+    });
+    return;
+  }
+
+  await waitForStableText(response, responseStableMs, timeoutMs);
+}
+
+export function validateAssistantNodeDelta({
+  beforeCount,
+  afterCount,
+  requireSingleAssistantNode = true,
+  name = 'agent',
+}) {
+  const delta = afterCount - beforeCount;
+  if (delta < 1) {
+    throw new Error(`${name} did not produce a new assistant response node`);
+  }
+  if (requireSingleAssistantNode && delta !== 1) {
+    throw new Error(
+      `${name} produced ${delta} assistant nodes; configure assistantMessage to identify exactly one final response container per turn`,
+    );
+  }
 }
 
 export class PlaywrightChatAgent {
@@ -98,26 +165,23 @@ export class PlaywrightChatAgent {
     const response = messages.nth(beforeCount);
     await response.waitFor({ state: 'visible' });
 
-    if (completion.generatingSelector) {
-      const generating = this.page.locator(completion.generatingSelector);
-      await generating.first().waitFor({
-        state: 'visible',
-        timeout: completion.startTimeoutMs ?? 10000,
-      }).catch(() => {});
-      await generating.first().waitFor({ state: 'hidden', timeout: timeoutMs });
-    } else if (completion.doneSelector) {
-      await response.locator(completion.doneSelector).first().waitFor({
-        state: 'visible',
-        timeout: timeoutMs,
-      });
-    } else {
-      await this.#waitForStableText(response, responseStableMs, timeoutMs);
-    }
+    await waitForCompletionSignal({
+      page: this.page,
+      response,
+      completion,
+      responseStableMs,
+      timeoutMs,
+      waitForStableText: this.#waitForStableText.bind(this),
+      name: this.config.name || 'agent',
+    });
 
     const afterCount = await messages.count();
-    if (completion.requireSingleAssistantNode !== false && afterCount !== beforeCount + 1) {
-      throw new Error(`${this.config.name || 'agent'} produced ${afterCount - beforeCount} assistant nodes; configure assistantMessage to identify exactly one final response container per turn`);
-    }
+    validateAssistantNodeDelta({
+      beforeCount,
+      afterCount,
+      requireSingleAssistantNode: completion.requireSingleAssistantNode !== false,
+      name: this.config.name || 'agent',
+    });
 
     const text = (await response.innerText()).trim();
     if (!text) throw new Error(`${this.config.name || 'agent'} returned an empty assistant response`);
