@@ -2,39 +2,22 @@
 
 这是一个给两个网页 AI 使用的 A/B 审核框架。
 
-- **A = Author / Final Owner**：负责初稿、核验 B 的意见、决定接受或拒绝、输出最终答案。
-- **B = Reviewer / Red Team**：负责找错和提出有证据的质疑，但不能直接成为“事实来源”。
-- **Controller**：保存原始任务、控制轮次、记录每次决策，并在长期分歧时停止，而不是让 A 被 B 无限带偏。
+- **A = Author / Final Owner**：负责初稿、独立核验 B 的意见、决定接受或拒绝、输出最终答案。
+- **B = Reviewer / Red Team**：负责找错和提出可追溯证据，但不能成为“事实来源”或直接指挥 A。
+- **Controller**：保存原始任务、控制轮次、维护可信 checkpoint，并在持续分歧时停止而不是让 A 被 B 逐轮带偏。
 
 ## 设计原则
 
 1. 原始任务和原始资料是不可变的 Source of Truth，每一轮都重新提供给 A/B。
-2. B 的 actionable issue 必须包含证据、严重度和置信度；没有证据的内容只能放到 uncertainties。
-3. A 必须对 B 的每条 issue 输出 `ACCEPT / REJECT / PARTIAL` 和理由，不能静默照单全收。
-4. 同一类质疑如果被 A 基于原始资料连续拒绝两次，Controller 返回 `DISAGREEMENT`，交给用户或第三个 Judge，而不是继续强迫 A 修改。
-5. 默认最多 3 轮；每一版和每一轮审核都可以落盘到 `sessions/`，便于人工比较和回滚。
-6. 浏览器自动化只负责“收发消息”，不绕过验证码、登录验证或网站保护机制。
-
-## 结构
-
-```text
-.
-├── AGENTS.md
-├── config/
-│   └── sites.example.json
-├── prompts/
-│   ├── agent-a.md
-│   └── reviewer-b.md
-├── src/
-│   ├── adapters/
-│   │   └── playwright-agent.js
-│   ├── cli.js
-│   ├── controller.js
-│   ├── protocol.js
-│   └── state-store.js
-└── test/
-    └── core.test.js
-```
+2. B 的 actionable issue 必须包含稳定 `target` 和结构化 `basis(type/locator/evidence)`；没有可定位证据的内容只能放到 uncertainties。
+3. A 必须对每条 issue 输出 `ACCEPT / REJECT / PARTIAL`，并提供自己独立核验的结构化 basis。
+4. B 的 `suggestion` 和 review summary 不传给 A；A 只看到问题、目标和证据，减少措辞和指令性文本造成的 steering。
+5. `REJECT` 或存在 residual dispute 的 `PARTIAL` 不会自动晋升为可信版本。Controller 始终保留最后一个 trusted checkpoint。
+6. 同一 `target + basis.type + basis.locator` 的争议如果连续多轮仍 unresolved，返回 `DISAGREEMENT`；返回值中的 `answer` 是最后可信 checkpoint，争议版单独放在 `disputedRevision`。
+7. 默认最多 3 轮，硬上限 12；所有轮次参数必须是有限正整数。
+8. 浏览器 profile 只用于保存登录认证，不允许默认复用旧对话。A/B 每轮都开启新的 conversation。
+9. 浏览器完成判断默认要求站点提供 generation/done 信号；仅文本稳定属于显式 opt-in 的不安全 fallback。
+10. 浏览器自动化不绕过验证码、登录验证或网站保护机制。
 
 ## 快速开始
 
@@ -44,7 +27,14 @@ npx playwright install chromium
 cp config/sites.example.json config/sites.json
 ```
 
-编辑 `config/sites.json`，填写两个网站的 URL 和选择器。建议先手动在持久化浏览器 profile 中完成正常登录；不要把账号、Cookie、Token 或浏览器 profile 提交到 GitHub。
+编辑 `config/sites.json`。每个站点至少需要：
+
+- `session.freshConversationUrl` 或 `session.newConversationSelector`
+- `selectors.input`
+- `selectors.assistantMessage`，应只匹配“一轮一个最终 assistant response container”
+- `completion.generatingSelector` 或 `completion.doneSelector`
+
+建议先手动在持久化 browser profile 中完成正常登录；不要把账号、Cookie、Token 或 browser profile 提交到 GitHub。
 
 运行：
 
@@ -53,14 +43,11 @@ npm start -- \
   --task "检查这份回答是否存在事实或逻辑错误" \
   --source-file ./source.md \
   --sites ./config/sites.json \
-  --max-rounds 3
+  --max-rounds 3 \
+  --disagreement-limit 2
 ```
 
-如果没有原始资料，可以省略 `--source-file`，但涉及事实核验时最好提供 Source of Truth。
-
 ## B 的输出协议
-
-B 必须返回 JSON：
 
 ```json
 {
@@ -72,30 +59,23 @@ B 必须返回 JSON：
       "id": "B-1",
       "severity": "major",
       "confidence": 0.91,
+      "target": "answer:claim-2",
       "claim": "候选答案中的结论与原始资料冲突",
-      "evidence": "原始资料第 2 段明确限定了条件 X",
-      "suggestion": "重新核对条件 X，不要直接把结论改成我给出的版本"
+      "basis": {
+        "type": "source",
+        "locator": "source:p2",
+        "evidence": "第 2 段明确限定了条件 X"
+      },
+      "suggestion": "重新核对条件 X"
     }
   ],
   "uncertainties": []
 }
 ```
 
-完全通过时：
-
-```json
-{
-  "status": "PASS",
-  "score": 95,
-  "summary": "未发现需要修改的可验证问题",
-  "issues": [],
-  "uncertainties": []
-}
-```
+同一实质问题跨轮次必须保持相同 `target + basis.type + basis.locator`，即使 claim 改写也会被 Controller 视为同一争议。
 
 ## A 的修订协议
-
-收到 B 的意见后，A 返回 JSON：
 
 ```json
 {
@@ -104,23 +84,38 @@ B 必须返回 JSON：
     {
       "issueId": "B-1",
       "verdict": "REJECT",
-      "reason": "B 的判断忽略了原始资料中的前置条件",
-      "sourceBasis": "原始资料第 2 段"
+      "reason": "B 忽略了前置条件",
+      "basis": {
+        "type": "source",
+        "locator": "source:p2",
+        "evidence": "第 2 段保留该前置条件"
+      },
+      "residualDispute": true
     }
   ]
 }
 ```
 
-A 必须覆盖 B 的每条 actionable issue。`REJECT` 是正常结果，不代表流程失败。
+`PARTIAL` 还必须提供 `acceptedPart` 和 `rejectedPart`。存在 residual dispute 的版本会被记录，但不会自动成为 trusted checkpoint。
 
 ## 状态结果
 
-Controller 可能返回：
+- `PASS`：B 明确通过当前候选答案。
+- `DISAGREEMENT`：同类 grounded issue 连续 unresolved。`answer` 返回最后可信 checkpoint，`disputedRevision` 单独提供。
+- `MAX_ROUNDS`：达到轮次上限。`answer` 仍返回最后可信 checkpoint；最新未解决候选可能出现在 `candidate`。
 
-- `PASS`：B 明确通过。
-- `DISAGREEMENT`：同类问题反复出现且 A 基于 Source of Truth 拒绝，建议人工/第三 Judge 裁决。
-- `MAX_ROUNDS`：达到轮次上限，保留最后版本和完整历史。
+## 浏览器传输安全
 
-## 后续接入 B
+持久化 profile 仅用于认证。`startSession()` 每次创建新 page，并要求通过“新会话 URL”或“New Chat 按钮”建立新的 conversation。
 
-后续 B 只需要遵循 `prompts/reviewer-b.md` 和上述 JSON schema。若 B 使用另一个网页 AI，只需在 `config/sites.json` 中补齐 `b` 的 URL 与 selectors；核心 Controller 不需要改。
+完成判断优先使用：
+
+1. `completion.generatingSelector`：生成期间可见，结束后隐藏；
+2. `completion.doneSelector`：最终 response 内出现完成标记；
+3. `allowStabilityFallback=true`：仅在没有更可靠信号时显式开启。
+
+如果一个站点会为同一回答生成多个 assistant DOM 节点，应把 `selectors.assistantMessage` 改成只匹配最终 response container；默认发现一轮新增多个节点会 fail closed。
+
+## 后续 B 审核
+
+B 可以直接审核 Draft PR。A 会读取 GitHub Review 并逐条形成 ACCEPT / REJECT / PARTIAL，不需要人工复制审核内容。

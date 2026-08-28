@@ -1,23 +1,82 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DualAIReviewController } from '../src/controller.js';
-import { validateReview } from '../src/protocol.js';
+import {
+  issueKey,
+  projectReviewForAuthor,
+  validateControllerLimits,
+  validateReview,
+} from '../src/protocol.js';
 
-test('review protocol rejects evidence-free actionable issues', () => {
-  assert.throws(() => validateReview({
+function issue(overrides = {}) {
+  return {
+    id: 'B-1',
+    severity: 'major',
+    confidence: 0.9,
+    target: 'answer:claim-1',
+    claim: 'The source does not support X.',
+    basis: {
+      type: 'source',
+      locator: 'source:p1',
+      evidence: 'Paragraph 1 states condition Y.',
+    },
+    suggestion: 'Re-check the condition.',
+    ...overrides,
+  };
+}
+
+function reviewWith(oneIssue) {
+  return {
     status: 'REVISE',
     score: 70,
     summary: 'needs work',
-    issues: [{
-      id: 'B-1',
-      severity: 'major',
-      confidence: 0.9,
-      claim: 'something is wrong',
-      evidence: '',
-      suggestion: 'change it',
-    }],
+    issues: [oneIssue],
     uncertainties: [],
-  }), /evidence is required/);
+  };
+}
+
+function decisionFor(issueId, verdict, overrides = {}) {
+  const residualDispute = verdict !== 'ACCEPT';
+  return {
+    issueId,
+    verdict,
+    reason: 'Checked independently.',
+    basis: {
+      type: 'source',
+      locator: 'source:p1',
+      evidence: 'Paragraph 1 is controlling.',
+    },
+    residualDispute,
+    ...(verdict === 'PARTIAL'
+      ? { acceptedPart: 'formatting concern', rejectedPart: 'factual change' }
+      : {}),
+    ...overrides,
+  };
+}
+
+test('review protocol rejects source basis without source of truth', () => {
+  assert.throws(() => validateReview(reviewWith(issue()), { hasSource: false }), /requires a Source of Truth/);
+});
+
+test('review protocol requires structured basis and stable target', () => {
+  assert.throws(() => validateReview(reviewWith(issue({ target: '' }))), /target is required/);
+  assert.throws(() => validateReview(reviewWith(issue({
+    basis: { type: 'source', locator: '', evidence: 'x' },
+  }))), /locator is required/);
+});
+
+test('issue identity is based on target and basis, not claim wording', () => {
+  const a = issue({ claim: 'The source does not support X.' });
+  const b = issue({ id: 'B-2', claim: 'X lacks support in the supplied material.' });
+  assert.equal(issueKey(a), issueKey(b));
+});
+
+test('reviewer suggestion is removed before A sees review data', () => {
+  const projected = projectReviewForAuthor(reviewWith(issue({
+    suggestion: 'Change the answer to Y immediately.',
+  })));
+  assert.equal(projected.issues[0].suggestion, undefined);
+  assert.equal(projected.summary, undefined);
 });
 
 test('controller returns PASS without unnecessary revision', async () => {
@@ -36,18 +95,13 @@ test('controller returns PASS without unnecessary revision', async () => {
   assert.equal(result.answer, 'draft');
 });
 
-test('repeated rejected critique escalates instead of forcing A to comply', async () => {
+test('DISAGREEMENT returns last trusted checkpoint, not disputed revision', async () => {
   const author = {
-    async draft() { return 'source-grounded answer'; },
-    async revise({ candidate, review }) {
+    async draft() { return 'trusted draft'; },
+    async revise({ review, round }) {
       return {
-        answer: candidate,
-        decisions: review.issues.map((issue) => ({
-          issueId: issue.id,
-          verdict: 'REJECT',
-          reason: 'Reviewer claim conflicts with the supplied source.',
-          sourceBasis: 'source paragraph 1',
-        })),
+        answer: `drifted toward B in round ${round}`,
+        decisions: review.issues.map((item) => decisionFor(item.id, 'REJECT')),
       };
     },
   };
@@ -56,20 +110,12 @@ test('repeated rejected critique escalates instead of forcing A to comply', asyn
   const reviewer = {
     async review() {
       round += 1;
-      return {
-        status: 'REVISE',
-        score: 70,
-        summary: 'same critique again',
-        issues: [{
-          id: `B-${round}`,
-          severity: 'major',
-          confidence: 0.9,
-          claim: 'The same disputed factual claim should be changed.',
-          evidence: 'Reviewer cites a reading that A says conflicts with source paragraph 1.',
-          suggestion: 'Re-check source paragraph 1.',
-        }],
-        uncertainties: [],
-      };
+      return reviewWith(issue({
+        id: `B-${round}`,
+        claim: round === 1
+          ? 'The source does not support X.'
+          : 'X lacks support in the supplied material.',
+      }));
     },
   };
 
@@ -78,9 +124,81 @@ test('repeated rejected critique escalates instead of forcing A to comply', asyn
     reviewer,
     maxRounds: 5,
     disagreementLimit: 2,
-  }).run({ task: 'test', source: 'authoritative source paragraph 1' });
+  }).run({ task: 'test', source: 'authoritative source p1' });
 
   assert.equal(result.status, 'DISAGREEMENT');
   assert.equal(result.rounds, 2);
-  assert.equal(result.answer, 'source-grounded answer');
+  assert.equal(result.answer, 'trusted draft');
+  assert.equal(result.disputedRevision, 'drifted toward B in round 2');
+});
+
+test('reject-accept-reject is not treated as consecutive disagreement', async () => {
+  let revisionRound = 0;
+  const author = {
+    async draft() { return 'v0'; },
+    async revise({ review }) {
+      revisionRound += 1;
+      const verdict = revisionRound === 2 ? 'ACCEPT' : 'REJECT';
+      return {
+        answer: `v${revisionRound}`,
+        decisions: review.issues.map((item) => decisionFor(item.id, verdict)),
+      };
+    },
+  };
+
+  let reviewRound = 0;
+  const reviewer = {
+    async review() {
+      reviewRound += 1;
+      if (reviewRound === 4) {
+        return { status: 'PASS', score: 95, summary: 'ok', issues: [], uncertainties: [] };
+      }
+      return reviewWith(issue({ id: `B-${reviewRound}` }));
+    },
+  };
+
+  const result = await new DualAIReviewController({
+    author,
+    reviewer,
+    maxRounds: 4,
+    disagreementLimit: 2,
+  }).run({ task: 'test', source: 'source p1' });
+
+  assert.equal(result.status, 'PASS');
+});
+
+test('repeated PARTIAL residual dispute escalates', async () => {
+  const author = {
+    async draft() { return 'v0'; },
+    async revise({ review, round }) {
+      return {
+        answer: `v${round}`,
+        decisions: review.issues.map((item) => decisionFor(item.id, 'PARTIAL')),
+      };
+    },
+  };
+
+  const reviewer = {
+    async review({ round }) {
+      return reviewWith(issue({ id: `B-${round}` }));
+    },
+  };
+
+  const result = await new DualAIReviewController({
+    author,
+    reviewer,
+    maxRounds: 3,
+    disagreementLimit: 2,
+  }).run({ task: 'test', source: 'source p1' });
+
+  assert.equal(result.status, 'DISAGREEMENT');
+  assert.equal(result.answer, 'v0');
+});
+
+test('controller limits reject unsafe values', () => {
+  for (const bad of [NaN, Infinity, 0, -1, 1.5, 13]) {
+    assert.throws(() => validateControllerLimits({ maxRounds: bad, disagreementLimit: 1 }));
+  }
+  assert.throws(() => validateControllerLimits({ maxRounds: 3, disagreementLimit: NaN }));
+  assert.throws(() => validateControllerLimits({ maxRounds: 3, disagreementLimit: 4 }));
 });

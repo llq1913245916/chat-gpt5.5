@@ -5,11 +5,20 @@
     "profileDir": ".browser-profiles/a",
     "headless": false,
     "timeoutMs": 120000,
-    "responseStableMs": 1800,
+    "responseStableMs": 2500,
+    "session": {
+      "newConversationSelector": "[data-action='new-chat']",
+      "readySelector": "textarea"
+    },
+    "completion": {
+      "generatingSelector": "[data-state='generating']",
+      "requireSingleAssistantNode": true,
+      "allowStabilityFallback": false
+    },
     "selectors": {
       "input": "textarea",
       "send": "button[type='submit']",
-      "assistantMessage": "[data-role='assistant']"
+      "assistantMessage": "[data-role='assistant'][data-final='true']"
     }
   },
   "b": {
@@ -18,11 +27,20 @@
     "profileDir": ".browser-profiles/b",
     "headless": false,
     "timeoutMs": 120000,
-    "responseStableMs": 1800,
+    "responseStableMs": 2500,
+    "session": {
+      "newConversationSelector": "[data-action='new-chat']",
+      "readySelector": "textarea"
+    },
+    "completion": {
+      "generatingSelector": "[data-state='generating']",
+      "requireSingleAssistantNode": true,
+      "allowStabilityFallback": false
+    },
     "selectors": {
       "input": "textarea",
       "send": "button[type='submit']",
-      "assistantMessage": "[data-role='assistant']"
+      "assistantMessage": "[data-role='assistant'][data-final='true']"
     }
   }
 }
