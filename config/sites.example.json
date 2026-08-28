@@ -1,0 +1,28 @@
+{
+  "a": {
+    "name": "Author A",
+    "url": "https://example-a.invalid/",
+    "profileDir": ".browser-profiles/a",
+    "headless": false,
+    "timeoutMs": 120000,
+    "responseStableMs": 1800,
+    "selectors": {
+      "input": "textarea",
+      "send": "button[type='submit']",
+      "assistantMessage": "[data-role='assistant']"
+    }
+  },
+  "b": {
+    "name": "Reviewer B",
+    "url": "https://example-b.invalid/",
+    "profileDir": ".browser-profiles/b",
+    "headless": false,
+    "timeoutMs": 120000,
+    "responseStableMs": 1800,
+    "selectors": {
+      "input": "textarea",
+      "send": "button[type='submit']",
+      "assistantMessage": "[data-role='assistant']"
+    }
+  }
+}
